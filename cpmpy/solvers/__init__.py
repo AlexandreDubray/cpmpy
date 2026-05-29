@@ -45,6 +45,7 @@ List of solver submodules
     rc2
     scip
     highs
+    aicad
 
 =========================
 List of helper submodules
@@ -82,6 +83,7 @@ from .hexaly import CPM_hexaly
 from .rc2 import CPM_rc2
 from .scip import CPM_scip
 from .highs import CPM_highs
+from .aicad import CPM_aicad
 
 __all__ = [
     "CPM_choco",
@@ -101,6 +103,7 @@ __all__ = [
     "CPM_rc2",
     "CPM_scip",
     "CPM_z3",
+    "CPM_aicad",
     "SolverLookup",
     "param_combinations",
 ]
