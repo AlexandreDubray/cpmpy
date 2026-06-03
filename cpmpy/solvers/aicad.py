@@ -453,3 +453,6 @@ class CPM_aicad(SolverInterface):
                 cpm_var.clear()
 
         return has_sol
+
+    def native_solver(self):
+        return self.acd_solver
