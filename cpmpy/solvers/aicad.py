@@ -124,13 +124,15 @@ class CPM_aicad(SolverInterface):
 
         import pyaicad 
 
-        assert subsolver is None # unless you support subsolvers, see pysat or minizinc
+        self.nn_model = None
+        if subsolver == "consformer":
+            self.nn_model = subsolver
 
         # initialise the native solver object
         self.acd_solver = pyaicad.Solver()
 
         # initialise everything else and post the constraints/objective
-        super().__init__(name="TEMPLATE", cpm_model=cpm_model)
+        super().__init__(name="aicad", cpm_model=cpm_model)
 
 
     @property
@@ -149,19 +151,27 @@ class CPM_aicad(SolverInterface):
             - kwargs:      any keyword argument, sets parameters of solver object
 
             Arguments that correspond to solver parameters:
-            - ``max_width`` : Optional[int]
-            - ``order``: Optional[pyaicad::PyOrderingHeuristic]
-            - ``merge``: Optional[pyaicad::PyMergeHeuristic]
-
-            For a complete description of the parameters, see https://github.com/AlexandreDubray/aicad
+            - max_width: Maximum width for MDD compilation (int, optional)
+            - order: Ordering heuristic for the variables (PyOrderingHeuristic, optional)
+            - merge: Merging heuristic for the MDD compilation (PyMergeHeuristic, optional)
+            - compile_mode: If true, return the MDD structure instead of the solution (bool, optional)
         """
 
         from pyaicad import PyOrderingHeuristic, PyMergeHeuristic
-
-        # ensure all vars are known to solver
         start = time.time()
+
+        if self.nn_model == "consformer":
+
+            from copnn.consformer import build_consformer
+            import torch.nn.functional as F
+            import torch
+
+            task = kwargs["nn_task"]
+            model_path = kwargs["model_path"]
+            parameters = self.get_consformer_parameters(task)
+            self.nn = build_consformer(parameters, model_path)
+
         self.solver_vars(list(self.user_vars))
-        end = time.time()
 
         max_width = kwargs.get("max_width")
         if max_width is None:
@@ -175,8 +185,15 @@ class CPM_aicad(SolverInterface):
         if merge is None:
             merge = PyMergeHeuristic.LessRelaxed
 
-        # TODO: Handle time limit
-        sol = self.acd_solver.solve(max_width, order, merge)
+        max_iter = kwargs.get("max_iter")
+        if max_iter is None:
+            max_iter = 10_000
+
+        compile_mode = kwargs.get("compile_mode")
+
+        self.acd_solver.solve(max_width, order, merge)
+        if compile_mode:
+            return self.acd_solver.topological_order()
 
         # [GUIDELINE] consider saving the status as self.TPL_status so that advanced CPMpy users can access the status object.
         #       This is mainly useful when more elaborate information about the solve-call is saved into the status
@@ -342,7 +359,7 @@ class CPM_aicad(SolverInterface):
         for cpm_expr in self.transform(cpm_expr_orig):
             if isinstance(cpm_expr, _BoolVarImpl):
                 # base case, just var or ~var
-                self.TPL_solver.add_clause([ self.solver_var(cpm_expr) ])
+                raise NotImplementedError("Aicad: no support (yet) for unary clauses")
 
             elif isinstance(cpm_expr, Operator):
                 if cpm_expr.name == "or":
@@ -386,73 +403,36 @@ class CPM_aicad(SolverInterface):
         """
         raise NotImplementedError("Aicad does not support yet finding all solutions")
 
-    def solve(self, time_limit:Optional[float]=None, **kwargs):
-        """
-            Call the TEMPLATE solver
+    def get_consformer_parameters(self, task):
+        from copnn.consformer import ConsformerParams
 
-            Arguments:
-            - time_limit:  maximum solve time in seconds (float, optional)
-            - kwargs:      any keyword argument, sets parameters of solver object
+        hyperparams = {}
 
-            Arguments that correspond to solver parameters:
-            - ``max_width`` : Optional[int]
-            - ``order``: Optional[pyaicad::PyOrderingHeuristic]
-            - ``merge``: Optional[pyaicad::PyMergeHeuristic]
-            - ``force_recompile``: Optional[bool]
+        if task != 'sudoku':
+            raise ValueError(f"Unsuported task for Consformer: {task}")
 
-            For a complete description of the parameters, see https://github.com/AlexandreDubray/aicad
-        """
+        # model params for sudoku
+        if task == 'sudoku':
+            domain_size = 9
+            head_count = 3
+            layer_count = 7
+            hidden_size = 128
+            subset_threshold = 0.5
+            ape_dim = 2
 
-        from pyaicad import PyOrderingHeuristic, PyMergeHeuristic
+        hyperparams[ConsformerParams.INPUT_SIZE] = domain_size
+        hyperparams[ConsformerParams.OUTPUT_SIZE] = domain_size
+        hyperparams[ConsformerParams.EMBEDDING_SIZE] = hidden_size
+        hyperparams[ConsformerParams.HIDDEN_SIZE] = hidden_size
+        hyperparams[ConsformerParams.EXPAND_SIZE] = hidden_size
+        hyperparams[ConsformerParams.HEAD_COUNT] = head_count
+        hyperparams[ConsformerParams.LAYER_COUNT] = layer_count
+        hyperparams[ConsformerParams.VOCAB_SIZE] = domain_size
+        hyperparams[ConsformerParams.DROPOUT] = 0.1
+        hyperparams[ConsformerParams.MIXING] = "add"
+        hyperparams[ConsformerParams.APE_DIM] = ape_dim
+        hyperparams[ConsformerParams.RPE] = "mask"
+        hyperparams[ConsformerParams.GUMBEL] = True 
+        hyperparams[ConsformerParams.TAU] = 0.1
 
-        # ensure all vars are known to solver
-        start = time.time()
-        self.solver_vars(list(self.user_vars))
-
-        # TODO: Handle time limit
-        sol = self.acd_solver.solve(**kwargs)
-        end = time.time()
-
-        # [GUIDELINE] consider saving the status as self.TPL_status so that advanced CPMpy users can access the status object.
-        #       This is mainly useful when more elaborate information about the solve-call is saved into the status
-
-        # new status, translate runtime
-        self.cpm_status = SolverStatus(self.name)
-        self.cpm_status.runtime = end - start
-
-        # Translate solver exit status to CPMpy exit status
-        # CSP:                         COP:
-        # ├─ sat -> FEASIBLE           ├─ optimal -> OPTIMAL
-        # ├─ unsat -> UNSATISFIABLE    ├─ sub-optimal -> FEASIBLE
-        # └─ timeout -> UNKNOWN        ├─ unsat -> UNSATISFIABLE
-        #                              └─ timeout -> UNKNOWN
-        if self.acd_solver.is_unsat():
-            self.cpm_status.exitstatus = ExitStatus.UNSATISFIABLE
-        elif sol is not None:
-            self.cpm_status.exitstatus = ExitStatus.FEASIBLE
-        else:
-            self.cpm_status.exitstatus = ExitStatus.UNKNOWN
-
-        # True/False depending on self.cpm_status
-        has_sol = self._solve_return(self.cpm_status)
-
-        # translate solution values (of user specified variables only)
-        self.objective_value_ = None
-        if has_sol:
-            # fill in variable values
-            for cpm_var in self.user_vars:
-                sol_var = self.solver_var(cpm_var)
-                cpm_var._value = sol[sol_var]
-
-            # translate objective, for optimisation problems only
-            if self.has_objective():
-                raise NotImplementedError("Optimisation is not supported by aicad")
-
-        else: # clear values of variables
-            for cpm_var in self.user_vars:
-                cpm_var.clear()
-
-        return has_sol
-
-    def native_solver(self):
-        return self.acd_solver
+        return hyperparams
