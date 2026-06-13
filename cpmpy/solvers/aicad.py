@@ -124,10 +124,7 @@ class CPM_aicad(SolverInterface):
 
         import pyaicad 
 
-        self.nn_model = None
-        if subsolver == "consformer":
-            self.nn_model = subsolver
-
+        self.subsolver = subsolver
         # initialise the native solver object
         self.acd_solver = pyaicad.Solver()
 
@@ -142,6 +139,87 @@ class CPM_aicad(SolverInterface):
         """
         return None
 
+    def neural_local_search(self, time_limit, **kwargs):
+        from copnn.consformer import build_consformer
+        import torch.nn.functional as F
+        import torch
+
+        if time_limit is None:
+            time_limit = 2**64 - 1
+        start = time.time()
+        max_iter = kwargs.get('max_iter', 10_000)
+
+        task = kwargs["nn_task"]
+        model_path = kwargs["model_path"]
+        parameters = self.get_consformer_parameters(task)
+
+        nn = build_consformer(parameters, model_path, parameters["cgraph"])
+
+        # Create the initial one-hot tensor
+        nb_var = self.acd_solver.number_variables()
+        if task == 'sudoku':
+            domain_size = 9
+
+        # Probabilities from which we get the assignments. It will be fed to the NN and updated accordingly
+        probabilities = torch.softmax(torch.rand((nb_var, domain_size)), dim=-1)
+
+        # Create the initial solution. First, we get the variable indexes (i.e., the vars that has domain_size > 1)
+        var_ind = torch.ones((nb_var,), dtype=torch.bool)
+        for var in range(nb_var):
+            if self.acd_solver.variable_domain_size(var) == 1:
+                var_ind[var] = False
+                probabilities[var, ...] = torch.zeros((domain_size))
+                value = self.acd_solver.variable_domain(var)[0]
+                probabilities[var, value] = 1.0
+        sol = probabilities.argmax(dim=-1).tolist()
+        step = 0
+        while (time.time() - start) < time_limit and step < max_iter and not self.acd_solver.is_solution(sol):
+            print(f"Iteration {step + 1}/{max_iter} prop. satisfied: {self.acd_solver.proportion_satisfied_constraints(sol)}")
+            noise = torch.rand(var_ind.shape, device=var_ind.device)
+            mask = (noise > 0.5)
+            var_ind_mask = var_ind & mask
+            probabilities = nn(probabilities.unsqueeze(0), var_ind_mask.unsqueeze(0)).squeeze(0)
+            sol = torch.argmax(probabilities, dim=-1).tolist()
+            step += 1
+
+        end = time.time()
+
+        self.cpm_status = SolverStatus(self.name)
+        self.cpm_status.runtime = end - start
+        self.cpm_status.iterations = step
+
+        # Translate solver exit status to CPMpy exit status
+        # CSP:                         COP:
+        # ├─ sat -> FEASIBLE           ├─ optimal -> OPTIMAL
+        # ├─ unsat -> UNSATISFIABLE    ├─ sub-optimal -> FEASIBLE
+        # └─ timeout -> UNKNOWN        ├─ unsat -> UNSATISFIABLE
+        #                              └─ timeout -> UNKNOWN
+        if self.acd_solver.is_solution(sol):
+            self.cpm_status.exitstatus = ExitStatus.FEASIBLE
+        else:
+            self.cpm_status.exitstatus = ExitStatus.UNKNOWN
+
+        # True/False depending on self.cpm_status
+        has_sol = self._solve_return(self.cpm_status)
+
+        # translate solution values (of user specified variables only)
+        self.objective_value_ = None
+        if has_sol:
+            # fill in variable values
+            for cpm_var in self.user_vars:
+                sol_var = self.solver_var(cpm_var)
+                cpm_var._value = sol[sol_var]
+
+            # translate objective, for optimisation problems only
+            if self.has_objective():
+                raise NotImplementedError("Optimisation is not supported by aicad")
+
+        else: # clear values of variables
+            for cpm_var in self.user_vars:
+                cpm_var.clear()
+
+        return has_sol
+
     def solve(self, time_limit:Optional[float]=None, **kwargs):
         """
             Call the TEMPLATE solver
@@ -154,46 +232,29 @@ class CPM_aicad(SolverInterface):
             - max_width: Maximum width for MDD compilation (int, optional)
             - order: Ordering heuristic for the variables (PyOrderingHeuristic, optional)
             - merge: Merging heuristic for the MDD compilation (PyMergeHeuristic, optional)
-            - compile_mode: If true, return the MDD structure instead of the solution (bool, optional)
+            - compile: If present, return the MDD instead of the solution (bool, optional, default False)
+
+            Arguments specific to NLS sub-solvers (consformer):
+            - model_path: Path to the saved weight of the NN model (required)
+            - max_iter: Maximum number of iterations for neural local search (int, optional, default 10_000)
+            - nn_task: Task for the neural network (i.e., problem being solved). Currently hard coded
+            - symbolic_reasoning: Which symbolic reasoning to use after nn prediction (str, optional, default None)
         """
+        symbolic_reasoning = kwargs.get("symbolic_reasoning")
+        if self.subsolver == 'consformer' and symbolic_reasoning is None:
+            return self.neural_local_search(time_limit, **kwargs)
 
         from pyaicad import PyOrderingHeuristic, PyMergeHeuristic
         start = time.time()
 
-        if self.nn_model == "consformer":
-
-            from copnn.consformer import build_consformer
-            import torch.nn.functional as F
-            import torch
-
-            task = kwargs["nn_task"]
-            model_path = kwargs["model_path"]
-            parameters = self.get_consformer_parameters(task)
-            self.nn = build_consformer(parameters, model_path)
-
         self.solver_vars(list(self.user_vars))
 
-        max_width = kwargs.get("max_width")
-        if max_width is None:
-            max_width = 2**64 - 1
-
-        order = kwargs.get("order")
-        if order is None:
-            order = PyOrderingHeuristic.MinDomMaxLinked()
-
-        merge = kwargs.get("merge")
-        if merge is None:
-            merge = PyMergeHeuristic.LessRelaxed
-
-        max_iter = kwargs.get("max_iter")
-        if max_iter is None:
-            max_iter = 10_000
-
-        compile_mode = kwargs.get("compile_mode")
-
-        self.acd_solver.solve(max_width, order, merge)
-        if compile_mode:
-            return self.acd_solver.topological_order()
+        max_width = kwargs.get("max_wdith", 2**64 - 1)
+        order = kwargs.get("order", PyOrderingHeuristic.MinDomMaxLinked())
+        merge = kwargs.get("merge", PyMergeHeuristic.LessRelaxed)
+        compiler = kwargs.get("compile", False)
+        sol = self.acd_solver.solve(max_width, order, merge)
+        end = time.time()
 
         # [GUIDELINE] consider saving the status as self.TPL_status so that advanced CPMpy users can access the status object.
         #       This is mainly useful when more elaborate information about the solve-call is saved into the status
@@ -214,6 +275,9 @@ class CPM_aicad(SolverInterface):
             self.cpm_status.exitstatus = ExitStatus.FEASIBLE
         else:
             self.cpm_status.exitstatus = ExitStatus.UNKNOWN
+
+        if compiler:
+            return self.acd_solver.topological_order()
 
         # True/False depending on self.cpm_status
         has_sol = self._solve_return(self.cpm_status)
@@ -371,6 +435,8 @@ class CPM_aicad(SolverInterface):
                 lhs, rhs = cpm_expr.args
                 if cpm_expr.name == "==":
                     self.acd_solver.add_equal(self.solver_var(lhs), self.solver_var(rhs))
+                elif cpm_expr.name == "!=":
+                    self.acd_solver.add_not_equals(self.solver_var(lhs), self.solver_var(rhs))
                 else:
                     raise NotImplementedError("Aicad: no support (yet) for comparisons:", cpm_expr)
             # global constraints
@@ -405,6 +471,7 @@ class CPM_aicad(SolverInterface):
 
     def get_consformer_parameters(self, task):
         from copnn.consformer import ConsformerParams
+        import torch
 
         hyperparams = {}
 
@@ -420,6 +487,18 @@ class CPM_aicad(SolverInterface):
             subset_threshold = 0.5
             ape_dim = 2
 
+            nb_var = self.acd_solver.number_variables()
+            nb_cstr = self.acd_solver.number_constraints()
+
+            binary_constraint_graph = torch.zeros((nb_var, nb_var), dtype=torch.bool)
+            binary_constraint_graph.fill_diagonal_(True)
+            for constraint in range(nb_cstr):
+                scope = self.acd_solver.constraint_scope(constraint)
+                for i in range(len(scope)):
+                    for j in range(i+1, len(scope)):
+                        binary_constraint_graph[scope[i], scope[j]] = True
+                        binary_constraint_graph[scope[j], scope[i]] = True
+
         hyperparams[ConsformerParams.INPUT_SIZE] = domain_size
         hyperparams[ConsformerParams.OUTPUT_SIZE] = domain_size
         hyperparams[ConsformerParams.EMBEDDING_SIZE] = hidden_size
@@ -434,5 +513,6 @@ class CPM_aicad(SolverInterface):
         hyperparams[ConsformerParams.RPE] = "mask"
         hyperparams[ConsformerParams.GUMBEL] = True 
         hyperparams[ConsformerParams.TAU] = 0.1
+        hyperparams["cgraph"] = binary_constraint_graph.unsqueeze(0)
 
         return hyperparams
