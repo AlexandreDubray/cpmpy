@@ -159,6 +159,10 @@ class CPM_aicad(SolverInterface):
         nb_var = self.acd_solver.number_variables()
         if task == 'sudoku':
             domain_size = 9
+        elif task == 'gcol50-5' or task == 'gcol100-5':
+            domain_size = 5
+        else:
+            raise ValueError(f'Unknown task for NLS: {task}')
 
         # Probabilities from which we get the assignments. It will be fed to the NN and updated accordingly
         probabilities = torch.softmax(torch.rand((nb_var, domain_size)), dim=-1)
@@ -174,7 +178,6 @@ class CPM_aicad(SolverInterface):
         sol = probabilities.argmax(dim=-1).tolist()
         step = 0
         while (time.time() - start) < time_limit and step < max_iter and not self.acd_solver.is_solution(sol):
-            print(f"Iteration {step + 1}/{max_iter} prop. satisfied: {self.acd_solver.proportion_satisfied_constraints(sol)}")
             noise = torch.rand(var_ind.shape, device=var_ind.device)
             mask = (noise > 0.5)
             var_ind_mask = var_ind & mask
@@ -277,6 +280,7 @@ class CPM_aicad(SolverInterface):
             self.cpm_status.exitstatus = ExitStatus.UNKNOWN
 
         if compiler:
+            print(self.acd_solver.as_graphviz())
             return self.acd_solver.topological_order()
 
         # True/False depending on self.cpm_status
@@ -475,7 +479,9 @@ class CPM_aicad(SolverInterface):
 
         hyperparams = {}
 
-        if task != 'sudoku':
+        supported_tasks = ['sudoku', 'gcol50-5', 'gcol100-5']
+
+        if task not in supported_tasks:
             raise ValueError(f"Unsuported task for Consformer: {task}")
 
         # model params for sudoku
@@ -486,6 +492,27 @@ class CPM_aicad(SolverInterface):
             hidden_size = 128
             subset_threshold = 0.5
             ape_dim = 2
+
+            nb_var = self.acd_solver.number_variables()
+            nb_cstr = self.acd_solver.number_constraints()
+
+            binary_constraint_graph = torch.zeros((nb_var, nb_var), dtype=torch.bool)
+            binary_constraint_graph.fill_diagonal_(True)
+            for constraint in range(nb_cstr):
+                scope = self.acd_solver.constraint_scope(constraint)
+                for i in range(len(scope)):
+                    for j in range(i+1, len(scope)):
+                        binary_constraint_graph[scope[i], scope[j]] = True
+                        binary_constraint_graph[scope[j], scope[i]] = True
+
+        if task == 'gcol50-5' or task == 'gcol100-5':
+            ncols = int(task.split('-')[-1])
+            domain_size = ncols
+            head_count = 3
+            layer_count = 4
+            hidden_size = 128
+            subset_threshold = 0.7
+            ape_dim = 1
 
             nb_var = self.acd_solver.number_variables()
             nb_cstr = self.acd_solver.number_constraints()
